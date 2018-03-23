@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_CORE_UTIL_CTC_CTC_LOSS_CALCULATOR_H_
-#define TENSORFLOW_CORE_UTIL_CTC_CTC_LOSS_CALCULATOR_H_
+#ifndef TENSORFLOW_CORE_UTIL_HMM_MMI_LOSS_CALCULATOR_H_
+#define TENSORFLOW_CORE_UTIL_HMM_MMI_LOSS_CALCULATOR_H_
 
 #include <vector>
 #include <iomanip>
@@ -25,34 +25,25 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/util/work_sharder.h"
-#include "hmm_loss_util.h"
 #include <ctime>
 
-int T_maxes = 3; // time frames period, after which we subtract the max coeff of alpha/beta from alpha/beta
+int T_maxes = 3; // time frames period, after which we subtract the max coeff of alpha/beta from alpha/beta (for numerical stability)
+const double kLogZero = -std::numeric_limits<double>::infinity();
 
 namespace tensorflow {
-namespace ctc {
+namespace hmm {
 
 using strings::StrCat;
 
-class CTCLossCalculator {
-  // Connectionist Temporal Classification Loss
+class HmmMmiLossCalculator {
+  // Hidden Markov Model - Maximum Mutual Information Loss
   //
-  // Implementation by kanishkarao@, posenhuang@, and ebrevdo@.
+  // Implementation by lior.fritz@gmail.com
   //
-  // The CTC Loss layer learns a *transition* probability value for each
-  // input time step.  The transitions are on the class alphabet
-  //   {0, 1, ..., N-2}
-  // where N is the depth of the input layer (the size of the alphabet is N-1).
-  // Note: The token N-1 is reserved for the "no transition" output, so
-  // make sure that your input layer has a depth that's one larger than
-  // the set of classes you're training on.  Also make sure that your
-  // training labels do not have a class value of N-1, as training will skip
-  // these examples.
+  // The HMM-MMI loss layer learns the posteriors, priors and transition probabilities defined by the HMM model.
   //
-  // Reference materials:
-  //  GravesTh: Alex Graves, "Supervised Sequence Labelling with Recurrent
-  //    Neural Networks" (PhD Thesis), Technische Universit¨at M¨unchen.
+  // Reference materials: Simplified End-to-End MMI Training and Voting for ASR (https://arxiv.org/abs/1703.10356)
+  //  .
  public:
   typedef std::vector<std::vector<int>> LabelSequences;
   typedef Eigen::MatrixXd Matrix;
@@ -60,7 +51,7 @@ class CTCLossCalculator {
   typedef Eigen::Map<const Eigen::MatrixXf> InputMap;
   typedef Eigen::Map<Eigen::MatrixXf> OutputMap;
 
-  CTCLossCalculator(int blank_index, int output_delay)
+  HmmMmiLossCalculator(int blank_index, int output_delay)
       : blank_index_(blank_index), output_delay_(output_delay) {}
 
   template <typename VectorIn, typename VectorOut, typename MatrixIn,
@@ -74,6 +65,7 @@ class CTCLossCalculator {
 
 private:
 
+  // Numerator forward-backward
   void CalculateAlpha(const std::vector<int>& l_prime,
                                  const Matrix& y, const Matrix& t_p, const Matrix& l_t_p, const Array& priors, bool hmm_merge_repeated,
                                  Matrix* log_alpha, Array* log_alpha_maxes) const;
@@ -82,12 +74,14 @@ private:
                                   const Matrix& y, const Matrix& t_p, const Matrix& l_t_p, bool hmm_merge_repeated,
                                   Matrix* log_beta, Array* log_beta_maxes) const;
 
+  // Denominator forward-backward
   void CalculateTildeAlpha(const Matrix& y, const Matrix& t_p, const Matrix& l_t_p, const Array& priors, bool hmm_merge_repeated,
                                  Matrix* log_alpha, Array* log_alpha_maxes) const;
 
   void CalculateTildeBeta(const Matrix& y, const Matrix& t_p, const Matrix& l_t_p, bool hmm_merge_repeated,
                                   Matrix* log_beta, Array* log_beta_maxes) const;
 
+  // Gradients
   void CalculateGradientsNumerator(const std::vector<int>& l_prime, const Matrix& y,
                          Matrix& log_alpha, const Array& log_alpha_maxes, Matrix& log_beta, const Array& log_beta_maxes,
                          const Array& log_p_z_x, const Array& priors, const Matrix& t_p, const Matrix& l_t_p,
@@ -112,7 +106,7 @@ private:
                          const LabelSequences& labels, size_t* max_u_prime,
                          LabelSequences* l_primes) const;
 
-  // Utility indices for the CTC algorithm.
+  // Utility indices for the algorithm.
   int blank_index_;
 
   // Delay for target labels in time steps.
@@ -134,7 +128,7 @@ inline double LogSumExp(double log_prob_1, double log_prob_2) {
 
 template <typename VectorIn, typename VectorOut, typename MatrixIn,
           typename MatrixOut, typename VectorInFloat, typename MatrixInFloat, typename VectorOutPriors, typename MatrixOutTrans>
-Status CTCLossCalculator::CalculateLoss(
+Status HmmMmiLossCalculator::CalculateLoss(
     const VectorIn& seq_len, const LabelSequences& labels,
     const std::vector<MatrixIn>& inputs, VectorInFloat& priors, MatrixInFloat& transition_probs, MatrixInFloat& lang_transition_probs, bool preprocess_collapse_repeated,
     bool hmm_merge_repeated, VectorOut* loss,
@@ -192,42 +186,26 @@ Status CTCLossCalculator::CalculateLoss(
     return l_p_ret;
   }
 
-    // Convert priors from tensor to vector
+  // Convert priors from tensor to vector
   Array priors_vec(num_classes);
   for (int i = 0; i < num_classes; i++) {
      priors_vec(i) = priors(i);
-//     priors_vec(i) = 1.0 / num_classes;
   }
-//  priors_vec(0) = 0.5325;
-//  priors_vec(1) = 1 - priors_vec(0);
-//  priors_vec(0) = 0.23; priors_vec(1) = 0.165; priors_vec(2) = 0.454; priors_vec(3) = 0.15;
-//  priors_vec(blank_index_) = 0.4;
-  // Priors vector must sum to 1
-  //priors_vec(num_classes - 1) = 1 - priors_sum;
-//  std::cout << "Priors:\n" << priors_vec << "\n";
+
   // Convert transition_probs from tensor to matrix
   Matrix t_p(num_classes, 2);
   for (int i=0; i < num_classes; i++) {
      t_p(i, 0) = transition_probs(i, 0);
      t_p(i, 1) = transition_probs(i, 1);
-//     t_p(i, 0) = 0.33333333333;
-//     t_p(i, 1) = 0.33333333333;
-//     t_p(i, 2) = 0.33333333333;
-     //t_p(i, 2) = 1 - transition_probs(i, 0) - transition_probs(i, 1); // Valid probability distribution
   }
-//  t_p(blank_index_, 1) = 1 - t_p(blank_index_, 0);
 
-//  std::cout << lang_transition_probs << "\n";
   // Convert language transition_probs from tensor to matrix
   Matrix l_t_p(num_classes, num_classes + 1); // Also transition from blank to end
   for (int i=0; i < num_classes; i++) {
-//    float lang_sum = 0;
     for (int j=0; j < num_classes + 1; j++) {
         l_t_p(i, j) = lang_transition_probs(i, j);
-//        lang_sum += l_t_p(i, j);
     }
   }
-//  std::cout << l_t_p << "\n";
 
   Eigen::MatrixXf d_priors_batch(batch_size, num_classes);
   Eigen::MatrixXf d_t_p_batch(batch_size * num_classes, 2);
@@ -241,7 +219,6 @@ Status CTCLossCalculator::CalculateLoss(
       int64 start_row, int64 limit_row) {
     for (int b = start_row; b < limit_row; b++) {
 
-//      clock_t overall_begin = std::clock();
       if (seq_len(b) == 0) {
         continue;
       }
@@ -257,7 +234,7 @@ Status CTCLossCalculator::CalculateLoss(
       Matrix log_tilde_beta_b(num_classes, seq_len(b) - this->output_delay_);
 
       int num_maxes = (seq_len(b) - this->output_delay_) / T_maxes;
-      // Plus 1 to avoid empty arrays, we don't access this index
+      // Plus 1 to avoid empty arrays. We don't access this index.
       Array log_alpha_b_maxes(num_maxes + 1);
       Array log_beta_b_maxes(num_maxes + 1);
       Array log_tilde_alpha_b_maxes(num_maxes + 1);
@@ -289,55 +266,16 @@ Status CTCLossCalculator::CalculateLoss(
         y_b.col(t) = y_b_col / y_b_col.sum();
       }
 
-//      std::cout << "Before priors:\n" << y_b << "\n";
       // Subtract priors from output activations
       for (int t=0; t < seq_len(b); t++) {
           y_b.col(t) = (y_b.col(t).array().log().matrix() - priors_vec.array().log().matrix());
       }
-      //y_b = (y_b.array().log().matrix() - priors_real.matrix()).array().exp().matrix();
-//      std::cout << "After priors:\n" << y_b << "\n";
 
-      // Compute forward, backward.
-      // Forward variables.
-//      clock_t begin = std::clock();
       CalculateAlpha(l_prime, y_b, t_p, l_t_p, priors_vec, hmm_merge_repeated, &log_alpha_b, &log_alpha_b_maxes);
-//      clock_t end = std::clock();
-//      double elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-//      std::cout << "Alpha calculation time: " << elapsed_secs << "\n";
-
-      // Backward variables.
-//      begin = std::clock();
-
       CalculateBeta(l_prime, y_b, t_p, l_t_p, hmm_merge_repeated, &log_beta_b, &log_beta_b_maxes);
-//      end = std::clock();
-//      elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-//      std::cout << "Beta calculation time: " << elapsed_secs << "\n";
-
-       // Denominator: Compute forward, backward.
-       // Forward variables.
-    //    std::cout << "Calculating Alpha and Beta for Denominator\n";
-//      begin = std::clock();
 
       CalculateTildeAlpha(y_b, t_p, l_t_p, priors_vec, hmm_merge_repeated, &log_tilde_alpha_b, &log_tilde_alpha_b_maxes);
-//      end = std::clock();
-//      elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-//      std::cout << "Alpha Tilde calculation time: " << elapsed_secs << "\n";
-    //    std::cout << "Done with Alpha\n";
-      // Backward variables.
-//      begin = std::clock();
       CalculateTildeBeta(y_b, t_p, l_t_p, hmm_merge_repeated, &log_tilde_beta_b, &log_tilde_beta_b_maxes);
-//      end = std::clock();
-//      elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-//      std::cout << "Beta Tilde calculation time: " << elapsed_secs << "\n";
-//    std::cout << "Done with Beta\n";
-
-      // The loss is computed as the log(p(z|x)) between the target and
-      // prediction. Do lazy evaluation of log_prob here.
-      // Get Beta's maxes sum for log_p_z_x evaluation
-//      std::cout << "log_alpha_maxes:\n" << log_alpha_b_maxes << "\n";
-//      std::cout << "log_tilde_alpha_maxes:\n" << log_tilde_alpha_b_maxes << "\n";
-//      std::cout << "log_beta_maxes:\n" << log_beta_b_maxes << "\n";
-//      std::cout << "log_tilde_beta_maxes:\n" << log_tilde_beta_b_maxes << "\n";
 
       double log_beta_maxes_sum = 0.0;
       double log_tilde_beta_maxes_sum = 0.0;
@@ -345,93 +283,43 @@ Status CTCLossCalculator::CalculateLoss(
         log_beta_maxes_sum += log_beta_b_maxes(t);
         log_tilde_beta_maxes_sum += log_tilde_beta_b_maxes(t);
       }
-//      std::cout << "log_beta_maxes_sum = " << log_beta_maxes_sum << "\n";
-//      std::cout << "log_tilde_beta_maxes_sum = " << log_tilde_beta_maxes_sum << "\n";
 
       Array log_p_z_x(seq_len(b));
       log_p_z_x.setConstant(kLogZero);
-//      std::cout << "log_p_z_x:\n";
-//      for (int t = 0; t < seq_len(b); ++t) {
-//      log_p_z_x = kLogZero;
+
       for (int t = 0; t < seq_len(b); ++t) {
           for (int u = 0; u < l_prime.size(); ++u) {
-            // (GravesTh) Eq 7.26, sum over all paths for t = 0.
             log_p_z_x(t) = LogSumExp(log_p_z_x(t), log_alpha_b(u, t) + log_beta_b(u, t));
           }
       }
-//      std::cout << log_p_z_x << "\n";
-//      }
-//      std::cout << "log_p_z_x_den:n\n";
+
       Array log_p_z_x_den(seq_len(b));
       log_p_z_x_den.setConstant(kLogZero);
-//      for (int t = 0; t < seq_len(b); ++t) {
-//      log_p_z_x_den = kLogZero;
+
       for (int t = 0; t < seq_len(b); ++t) {
           for (int u = 0; u < num_classes; ++u) {
-          // (GravesTh) Eq 7.26, sum over all paths for t = 0.
-          //std::cout << "Alpha:" << log_alpha_b(u, 0) << "\n";
-          //std::cout << "Beta:" << log_beta_b(u, 0) << "\n";
             log_p_z_x_den(t) = LogSumExp(log_p_z_x_den(t), log_tilde_alpha_b(u, t) + log_tilde_beta_b(u, t));
           }
       }
-//      std::cout << log_p_z_x_den << "\n";
-//      }
+        
+	  (*loss)(b) = (float) -(log_p_z_x(0) + log_beta_maxes_sum) + log_p_z_x_den(0) + log_tilde_beta_maxes_sum;  // Use negative log loss for display.
 
-//      double log_p_z_x_den = kLogZero;
-//      for (int u = 0; u < l_prime_den.size(); ++u) {
-//        // (GravesTh) Eq 7.26, sum over all paths for t = 0.
-//        if (b == 0) {
-//        if (log_p_z_x == kLogZero) {
-//            std::cout << "Alpha:\n" << log_alpha_b << "\n";
-//            std::cout << "Beta:\n" << log_beta_b << "\n";
-//        }
-//        std::cout << "Alpha:\n" << log_alpha_b << "\n";
-//        std::cout << "Alpha Tilde:\n" << log_tilde_alpha_b << "\n";
-//        std::cout << "Beta:\n" << log_beta_b << "\n";
-//        std::cout << "Beta Tilde:\n" << log_tilde_beta_b << "\n";
-//        std::cout << "log_p_z_x = " << log_p_z_x << "\n";
-//        std::cout << "log_p_z_x_den = " << log_p_z_x_den << "\n";
-
-//        }
-//        std::cout << "-----------------------------------\n";
-//        log_p_z_x_den = LogSumExp(log_p_z_x_den, log_alpha_den_b(u, 0) + log_beta_den_b(u, 0));
-//      }
-        (*loss)(b) = (float) -(log_p_z_x(0) + log_beta_maxes_sum) + log_p_z_x_den(0) + log_tilde_beta_maxes_sum;  // Use negative log loss for display.
-      // Derivative is needed only if the best path produces a higher P(O | Gamma*) than P(O | Gamma).
-//      if (log_p_z_x < log_p_z_x_den) {
-//      if (1) {
-//        (*loss)(b) = (float) -log_p_z_x + log_p_z_x_den;  // Use negative log loss for display.
-//      } else {
-//        (*loss)(b) = 0.0;
-//      }
-//      std::cout << log_p_z_x - log(seq_len(b)) << " " << log_p_z_x_den  - log(seq_len(b)) << "\n";
-
-      // We compute the derivative if needed.
-//      if ((requires_backprop) && (log_p_z_x < log_p_z_x_den)) {
       if (requires_backprop) {
         // Gradients with respect to input activations.
         // Calculate gradient.
         dy.setZero();
         Array alpha_beta_over_t_num(num_classes);
-//        begin = std::clock();
+
         CalculateGradientsNumerator(l_prime, y_b, log_alpha_b, log_alpha_b_maxes, log_beta_b, log_beta_b_maxes,
          log_p_z_x, priors_vec, t_p, l_t_p, &dy, &d_priors, &d_t_p, &alpha_beta_over_t_num, log_beta_maxes_sum);
-//        end = std::clock();
-//        elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-//        std::cout << "Numerator gradients calculation time: " << elapsed_secs << "\n";
 
-//        begin = std::clock();
         CalculateGradientsDenominator(y_b, log_tilde_alpha_b, log_tilde_alpha_b_maxes, log_tilde_beta_b, log_tilde_beta_b_maxes,
          log_p_z_x_den, priors_vec, t_p, l_t_p, alpha_beta_over_t_num, &dy, &d_priors, &d_t_p, log_tilde_beta_maxes_sum);
-//        end = std::clock();
-//        elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-//        std::cout << "Denominator gradients calculation time: " << elapsed_secs << "\n";
 
         // Convert gradient for current sample to DistBelief.
         for (int t = 0; t < seq_len(b); t++) {
           (*gradients)[t].row(b).array() = dy.col(t);
         }
-//
         for (int i=0; i < num_classes; i++) {
             d_priors_batch(b, i) = d_priors(i) / batch_size; // Averaging over all batches
         }
@@ -441,21 +329,10 @@ Status CTCLossCalculator::CalculateLoss(
           d_t_p_batch(batch_offset + i, 1) = d_t_p(i, 1) / batch_size; // Averaging over all batches
         }
 
-//        clock_t end = std::clock();
-//        double elapsed_secs = double(end - overall_begin) / CLOCKS_PER_SEC;
-//        std::cout << "Overall calculation time: " << elapsed_secs << "\n";
-
       }
     }  // for (int b = ...
   };
   if (workers) {
-    // *Rough* estimate of the cost for one item in the batch.
-    // Forward, Backward: O(T * U (= 2L + 1)), Gradients: O(T * (U + L)).
-    //
-    // softmax: T * L * (Cost(Exp) + Cost(Div))softmax +
-    // fwd,bwd: T * 2 * (2*L + 1) * (Cost(LogSumExp) + Cost(Log)) +
-    // grad: T * ((2L + 1) * Cost(LogSumExp) + L * (Cost(Expf) + Cost(Add)).
-    // MAP:
     // *Rough* estimate of the cost for one item in the batch.
     // Numerator's Forward, Backward: O((T - U) * U), Gradients: O(T * (U + L)).
     // Denominator's Forward, Backward: O(T * L * L), Gradients: O(T * L * L).
@@ -497,19 +374,13 @@ Status CTCLossCalculator::CalculateLoss(
         (*priors_gradient)(l) += d_priors_batch(b, l);
         (*trans_gradient)(l, 0) += d_t_p_batch(batch_offset + l, 0);
         (*trans_gradient)(l, 1) += d_t_p_batch(batch_offset + l, 1);
-//        (*priors_out)(l) += priors_count[b][l];
-//        (*trans_out)(l, 0) += trans_count[b][l][0];
-//        (*trans_out)(l, 1) += trans_count[b][l][1];
-//        (*trans_out)(l, 2) += trans_count[b][l][2];
     }
   }
-//  std::cout << "Priors gradient:" << "\n" << *priors_gradient << "\n";
-//    std::cout << "Blank trans grad: " << (*trans_gradient)(blank_index_, 0) << " " << (*trans_gradient)(blank_index_, 1) << "\n";
   return Status::OK();
 }
 
 template <typename Vector>
-Status CTCLossCalculator::PopulateLPrimesHMM(bool preprocess_collapse_repeated,
+Status HmmMmiLossCalculator::PopulateLPrimesHMM(bool preprocess_collapse_repeated,
                                           int batch_size, int num_classes,
                                           const Vector& seq_len,
                                           const LabelSequences& labels,
@@ -579,8 +450,6 @@ Status CTCLossCalculator::PopulateLPrimesHMM(bool preprocess_collapse_repeated,
           "), skipping data instance in batch: ", b);
     }
 
-    // Target indices with blanks before each index and a blank at the end.
-    // Length U' = 2U + 1.
     // Convert l to l_prime
     GetLPrimeIndicesHMM(l, &l_primes->at(b));
     *max_u_prime = std::max(*max_u_prime, l_primes->at(b).size());
@@ -588,11 +457,7 @@ Status CTCLossCalculator::PopulateLPrimesHMM(bool preprocess_collapse_repeated,
   return Status::OK();
 }
 
-
-// Calculates the alpha(t, u) as described in (GravesTh) Section 7.3.
-// Starting with t = 0 instead of t = 1 used in the text.
-// Based on Kanishka's CTC.
-void CTCLossCalculator::CalculateAlpha(
+void HmmMmiLossCalculator::CalculateAlpha(
     const std::vector<int>& l_prime, const Matrix& y, const Matrix& t_p, const Matrix& l_t_p, const Array& priors, bool hmm_merge_repeated,
     Matrix* log_alpha, Array* log_alpha_maxes) const {
   // Number of cols is the number of time steps = number of cols in target
@@ -604,8 +469,8 @@ void CTCLossCalculator::CalculateAlpha(
   int T = log_alpha->cols();
   CHECK_EQ(U, log_alpha->rows());
 
-  // Initial alpha values in (GravesTh) Eq 7.5 and Eq 7.6.
-  log_alpha->coeffRef(0, 0) = y(l_prime[0], output_delay_); // Transition probability from start to blank is 1.0
+  // Transition probability from start to blank is 1.0
+  log_alpha->coeffRef(0, 0) = y(l_prime[0], output_delay_); 
 
   for (int t = 1; t < T; ++t) {
     // If there is not enough time to output the remaining labels or
@@ -614,7 +479,6 @@ void CTCLossCalculator::CalculateAlpha(
     for (int u = std::max(0, U - (T - t)); u < std::min(U, t + 1);
          ++u) {
 
-//      clock_t begin = std::clock();
       // Begin recursion of alpha variable
       double sum_log_alpha = kLogZero;
       int l = l_prime[u];
@@ -641,17 +505,13 @@ void CTCLossCalculator::CalculateAlpha(
     }
 
   }
-//  std::cout << "log_alpha_maxes:\n" << *log_alpha_maxes << "\n";
 }
 
-// Calculates the beta(t, u) as described in (GravesTh) Section 7.3.
-void CTCLossCalculator::CalculateBeta(
+void HmmMmiLossCalculator::CalculateBeta(
     const std::vector<int>& l_prime, const Matrix& y, const Matrix& t_p, const Matrix& l_t_p, bool hmm_merge_repeated,
     Matrix* log_beta, Array* log_beta_maxes) const {
   // Number of cols is the number of time steps =  number of cols in target.
-  // Matrix log_beta =
-  //    Matrix::Constant(l_prime.size(), y.cols() - output_delay_,
-  // kLogZero);
+
   log_beta->setConstant(kLogZero);
   log_beta_maxes->setZero();
   int T = log_beta->cols();
@@ -660,19 +520,15 @@ void CTCLossCalculator::CalculateBeta(
   int L = y.rows(); // num_classes
   int end_index = L;
 
-  // Initial beta values in (GravesTh) Eq 7.13: log of probability 1.
-  //for (int u = U - 2; u < U; ++u) log_beta->coeffRef(u, T - 1) = 0;
-  log_beta->coeffRef(U - 1, T - 1) = log(t_p(l_prime[U - 1], 1)) + log(l_t_p(blank_index_, end_index)); // Transition from final blank to end
+  // Transition from final blank to end
+  log_beta->coeffRef(U - 1, T - 1) = log(t_p(l_prime[U - 1], 1)) + log(l_t_p(blank_index_, end_index));
 
-  // Must end at blank label
-  //log_beta->coeffRef(U - 1, T - 1) = 0;
+
   for (int t = T - 1 - 1; t >= 0; --t) {
     // If there is not enough time to output the remaining labels or
     // some labels have been skipped, then let log_beta(u, t) continue to
     // be kLogZero.
     for (int u = std::max(0, U - (T - t)); u < std::min(U, t + 1); ++u) {
-      // Begin (GravesTh) Eq 7.15
-      // Add in the u, t + 1 term.
 
       // Begin recursion of beta variable
       double sum_log_beta = kLogZero;
@@ -690,7 +546,6 @@ void CTCLossCalculator::CalculateBeta(
 
       // Update beta variable at u, t.
       log_beta->coeffRef(u, t) = sum_log_beta;
-      //std::cout << "log beta at u,t=" << u << "," << t << " is: " << log_beta->coeffRef(u, t) << "\n";
     }
 
     // Normalization
@@ -703,10 +558,7 @@ void CTCLossCalculator::CalculateBeta(
 }
 
 
-// Calculates the alpha(t, u) as described in (GravesTh) Section 7.3.
-// Starting with t = 0 instead of t = 1 used in the text.
-// Based on Kanishka's CTC.
-void CTCLossCalculator::CalculateTildeAlpha(
+void HmmMmiLossCalculator::CalculateTildeAlpha(
     const Matrix& y, const Matrix& t_p, const Matrix& l_t_p, const Array& priors, bool hmm_merge_repeated,
     Matrix* log_alpha, Array* log_alpha_maxes) const {
   // Number of cols is the number of time steps = number of cols in target
@@ -726,7 +578,6 @@ void CTCLossCalculator::CalculateTildeAlpha(
 
     for (int c = 0; c < L; ++c) {
 
-//      clock_t begin = std::clock();
       // Begin recursion of alpha variable
       double sum_log_alpha = kLogZero;
 
@@ -744,7 +595,7 @@ void CTCLossCalculator::CalculateTildeAlpha(
       // Multiply the summed alphas with the activation log probability (which is already subtracted by the prior).
       log_alpha->coeffRef(c, t) = y(c, output_delay_ + t) + sum_log_alpha;
 
-    }  // End (GravesTh) Eq 7.9.
+    }
 
     // Normalization
     if (t % T_maxes == 0) {
@@ -756,13 +607,11 @@ void CTCLossCalculator::CalculateTildeAlpha(
 }
 
 // Calculates the beta(t, u) as described in (GravesTh) Section 7.3.
-void CTCLossCalculator::CalculateTildeBeta(
+void HmmMmiLossCalculator::CalculateTildeBeta(
     const Matrix& y, const Matrix& t_p, const Matrix& l_t_p, bool hmm_merge_repeated,
     Matrix* log_beta, Array* log_beta_maxes) const {
   // Number of cols is the number of time steps =  number of cols in target.
-  // Matrix log_beta =
-  //    Matrix::Constant(l_prime.size(), y.cols() - output_delay_,
-  // kLogZero);
+
   log_beta->setConstant(kLogZero);
   log_beta_maxes->setZero();
   int T = log_beta->cols();
@@ -806,9 +655,8 @@ void CTCLossCalculator::CalculateTildeBeta(
   }
 }
 
-// Using (GravesTh) Eq 7.26 & 7.34.
 
-void CTCLossCalculator::CalculateGradientsNumerator(const std::vector<int>& l_prime,
+void HmmMmiLossCalculator::CalculateGradientsNumerator(const std::vector<int>& l_prime,
                                           const Matrix& y,
                                           Matrix& log_alpha,
                                           const Array& log_alpha_maxes,
@@ -828,10 +676,6 @@ void CTCLossCalculator::CalculateGradientsNumerator(const std::vector<int>& l_pr
   // targets are zero.
   if (log_p_z_x(0) == kLogZero) {
     LOG(WARNING) << "No valid path found.";
-//    for (int u = 0; u < l_prime.size(); ++u) {
-//        std::cout << l_prime[u] << " ";
-//    }
-//    std::cout << "\n";
     dy_b = y.template cast<float>();
     return;
   }
@@ -841,8 +685,6 @@ void CTCLossCalculator::CalculateGradientsNumerator(const std::vector<int>& l_pr
   int U = l_prime.size();
   int end_index = L;
 
-//  Array alpha_beta_over_t(L);
-//  alpha_beta_over_t.setConstant(kLogZero);
   alpha_beta_over_t_num->setConstant(kLogZero);
   Matrix trans_alpha_beta(L, 2);
   trans_alpha_beta.setConstant(kLogZero);
@@ -854,17 +696,7 @@ void CTCLossCalculator::CalculateGradientsNumerator(const std::vector<int>& l_pr
     for (int u = 0; u < U; ++u) {
       int l = l_prime[u];
       alpha_beta[l] = LogSumExp(alpha_beta[l], log_alpha(u, t) + log_beta(u, t));
-//      alpha_beta_over_t[l] = LogSumExp(alpha_beta_over_t[l], log_alpha(u, t) + log_beta(u, t));
       alpha_beta_over_t_num->coeffRef(l) = LogSumExp(alpha_beta_over_t_num->coeff(l), log_alpha(u, t) + log_beta(u, t) - log_p_z_x(t)); // Normalize prior's graidents with log_p_z_x here
-//      if (t > 0) {
-//        trans_alpha_beta(l, 0) = LogSumExp(trans_alpha_beta(l, 0), log_alpha(u, t - 1) + log_beta(u, t) + log(y(l, output_delay_ + t)));
-//        if (u > 0) {
-//            trans_alpha_beta(l_prime[u - 1], 1) = LogSumExp(trans_alpha_beta(l_prime[u - 1], 1), log_alpha(u - 1, t - 1) + log_beta(u, t) + log(y(l, output_delay_ + t)));
-//            if ((u > 1) && (l != blank_index_)) {
-//                trans_alpha_beta(l_prime[u - 2], 2) = LogSumExp(trans_alpha_beta(l_prime[u - 2], 2), log_alpha(u - 2, t - 1) + log_beta(u, t) + log(y(l, output_delay_ + t)));
-//            }
-//        }
-//      }
 
       // Normalize transition's gradients. Normalization might be different at each t (since we use alpha and beta at different t's).
       double trans_normalization_factor = log_p_z_x(t);
@@ -882,60 +714,25 @@ void CTCLossCalculator::CalculateGradientsNumerator(const std::vector<int>& l_pr
       }
     }
 
-    //std::cout << log_alpha(U - 2, T - 1) << "\n";
-    //std::cout << "alpha*beta over t at t = " << t << " is:\n" << alpha_beta_over_t << "\n";
-
     for (int l = 0; l < L; ++l) {
-      //std::cout << "Alpha Beta over t, for l = " << l << " is:\n" << alpha_beta_over_t << "\n";
-      // Negative term in (GravesTh) Eq 7.28.
       double negative_term = exp(alpha_beta[l] - log_p_z_x(t));
 
-      dy_b(l, output_delay_ + t) = (float) - negative_term; // Need to re-add the priors
-      //dy_b(l, output_delay_ + t) = y(l, output_delay_ + t) - negative_term;
+      dy_b(l, output_delay_ + t) = (float) - negative_term;
     }
-//    std::cout << "alpha_beta at t = " << t << " is:\n" << alpha_beta << "\n";
+
   }
   trans_alpha_beta(l_prime[U - 1], 1) = LogSumExp(trans_alpha_beta(l_prime[U - 1], 1), log_alpha(U - 1, T - 1)  - log_p_z_x(T - 1) + log(l_t_p(l_prime[U - 1], end_index)));
 
-//  std::cout << "alpha*beta over t for l=0 is: " << exp(alpha_beta_over_t[0]) << "\n";
-//  std::cout << "log_p_z_x = " << log_p_z_x << "\n";
-//  std::cout << "priors of l=0: " << priors(0) << "\n\n";
-//
-//  std::cout << "alpha*beta over t for l=b is: " << exp(alpha_beta_over_t[1]) << "\n";
-//  std::cout << "NOM: log_p_z_x = " << log_p_z_x << "\n";
-//  std::cout << "priors of l=1: " << priors(1) << "\n\n";
-//    std::cout << "alpha_beta_over_t:\n" << alpha_beta_over_t << "\n";
-  // Priors gradients
-//  for (int l = 0; l < L; ++l) {
-////    d_priors->coeffRef(l) = (float) exp(alpha_beta_over_t[l] - log(priors(l)) - log_p_z_x);
-//    alpha_beta_over_t_num->coeffRef(l) = alpha_beta_over_t_num->coeff(l) - log_p_z_x(0);
-//    //sum_of_priors_grads += d_priors->coeffRef(l);
-//  }
-  //for (int l = 0; l < L; ++l) {
-   // d_priors->coeffRef(l) += d_priors->coeffRef(l) - sum_of_priors_grads;
-  //}
-
-//  std::cout << "NOM: trans_alpha_beta is:\n" << trans_alpha_beta << "\n";
   // Transition probabilities gradients
   for (int l = 0; l < L; ++l) {
     d_t_p->coeffRef(l, 0) = (float) - exp(trans_alpha_beta(l, 0));
-//    std:: cout << "NOM: (-expf(trans_alpha_beta(l, 0) - log_p_z_x))=:\n" << (-expf(trans_alpha_beta(l, 0) - log_p_z_x)) << "\n";
-    //std:: cout << expf(trans_alpha_beta(l, 2)) << "\n";
+
     d_t_p->coeffRef(l, 1) = (float) - exp(trans_alpha_beta(l, 1));
   }
-  //d_t_p->coeffRef(l, 0) = d_t_p->coeffRef(l, 0) - d_t_p->coeffRef(l, 1) - d_t_p->coeffRef(l, 2);
-  //d_t_p->coeffRef(l, 1) = d_t_p->coeffRef(l, 1) - d_t_p->coeffRef(l, 0) - d_t_p->coeffRef(l, 2);
-  //d_t_p->coeffRef(l, 2) = d_t_p->coeffRef(l, 2) - d_t_p->coeffRef(l, 0) - d_t_p->coeffRef(l, 1);
-
-  //d_t_p->coeffRef(blank_index_, 2) = 0; // No transition from blank label to the next blank label
-//  std::cout << "Gradients of numerator:\n";
-//  std::cout << "Gradient of priors:\n" << *d_priors << "\n";
-//  std::cout << "Gradient of transitions:\n" << *d_t_p << "\n";
-//  std::cout << "Gradient of y's:\n" << dy_b << "\n";
 
 }
 
-void CTCLossCalculator::CalculateGradientsDenominator(
+void HmmMmiLossCalculator::CalculateGradientsDenominator(
                                           const Matrix& y,
                                           Matrix& log_alpha,
                                           const Array& log_alpha_maxes,
@@ -968,9 +765,6 @@ void CTCLossCalculator::CalculateGradientsDenominator(
   Matrix trans_alpha_beta(L, 2);
   trans_alpha_beta.setConstant(kLogZero);
 
-//  std::cout << "Gradients of numerator:\n";
-//  std::cout << "Gradient of y's:\n" << dy_b << "\n";
-
   for (int t = 0; t < T - output_delay_; ++t) {
 
     // Normalize transition's gradients. Normalization might be different at each t (since we use alpha and beta at different t's).
@@ -985,13 +779,8 @@ void CTCLossCalculator::CalculateGradientsDenominator(
       // Derivative of network's outputs
       double negative_term = exp(log_alpha(c, t) + log_beta(c, t) - log_p_z_x(t));
 
-//      std:: cout << "DEN: (expf(log(y(c, output_delay_ + t)) + log(priors(c))) - negative_term)=:\n" << (expf(log(y(c, output_delay_ + t)) + log(priors(c))) - negative_term) << "\n";
-
       float new_deriv = (float) - negative_term;
-//      std::cout << "new_deriv = " << new_deriv << "\n";
-//      std::cout << "Old derivative = " << dy_b(c, output_delay_ + t) << '\n';
-      dy_b(c, output_delay_ + t) = (dy_b(c, output_delay_ + t) - new_deriv); // Need to re-add the priors
-//      std::cout << "Updated derivative = " << dy_b(c, output_delay_ + t) << '\n';
+      dy_b(c, output_delay_ + t) = (dy_b(c, output_delay_ + t) - new_deriv); 
       alpha_beta_over_t[c] = LogSumExp(alpha_beta_over_t[c], log_alpha(c, t) + log_beta(c, t) - log_p_z_x(t)); // Normalize prior's graidents with log_p_z_x here
 
       if (t < T - 1) {
@@ -1010,94 +799,39 @@ void CTCLossCalculator::CalculateGradientsDenominator(
         }
       }
     }
-
-    //std::cout << log_alpha(U - 2, T - 1) << "\n";
-//    std::cout << "alpha*beta over t at t = " << t << " is:\n" << alpha_beta_over_t << "\n";
   }
 
   // Transitions from blank to end
   trans_alpha_beta(blank_index_, 1) = LogSumExp(trans_alpha_beta(blank_index_, 1), log_alpha(blank_index_, T - 1) + log(l_t_p(blank_index_, end_index)) - log_p_z_x(T - 1));
 
-//  std::cout << "alpha*beta over t for l=0 is: " << exp(alpha_beta_over_t[0]) << "\n";
-//  std::cout << "log_p_z_x = " << log_p_z_x << "\n";
-//  std::cout << "priors of l=0: " << priors(0) << "\n\n";
-//    std::cout << "trans_alpha_beta:\n" << trans_alpha_beta << "\n";
-//  std::cout << "alpha*beta over t is:\n" << alpha_beta_over_t << "\n";
-//  std::cout << "DEN: log_p_z_x of denominator = " << log_
-
-
-//  std::cout << "priors of l=1: " << priors(1) << "\n\n";
-//  std::cout << alpha_beta_over_t_num << "\n";
   float new_deriv;
-//  float sum_of_priors_grads = 0;
+
   // Priors gradients
   for (int l = 0; l < L; ++l) {
-//    std:: cout << "DEN: (expf(alpha_beta_over_t[l] - log(priors(l)) - log_p_z_x))=:\n" << (expf(alpha_beta_over_t[l] - log(priors(l)) - log_p_z_x)) << "\n";
-//    std::cout << "l = " << l << "\n";
-//    new_deriv = (float) exp(alpha_beta_over_t[l] - log(priors(l)));
-//    std::cout << std::setprecision (15) << "new deriv = " << new_deriv << "\n";
-//    std::cout << "new_deriv = " << exp(alpha_beta_over_t[l] - log(priors(l)) - log_p_z_x) << "\n";
-//    std::cout << std::setprecision (15) << "former deriv = " << d_priors->coeff(l) << "\n";
     d_priors->coeffRef(l) = (exp(alpha_beta_over_t_num[l] - log(priors(l))) - exp(alpha_beta_over_t[l] - log(priors(l))));
-//      d_priors->coeffRef(l) = (- exp(alpha_beta_over_t[l] - log(priors(l)) - log_p_z_x));
-//    std::cout << std::setprecision (15) << "final deriv = " << d_priors->coeff(l) << "\n";
-//    std::cout << "----------------------------------------\n\n";
-    //sum_of_priors_grads += d_priors->coeffRef(l);
   }
-  //for (int l = 0; l < L; ++l) {
-   // d_priors->coeffRef(l) += d_priors->coeffRef(l) - sum_of_priors_grads;
-  //}
-//  std::cout << "Blank trans grad numerator: " << d_t_p->coeff(blank_index_,0) << " " << d_t_p->coeff(blank_index_,1) << "\n";
-//  std::cout << "DEN: trans_alpha_beta is:\n" << trans_alpha_beta << "\n";
+
   // Transition probabilities gradients
   for (int l = 0; l < L; ++l) {
-//    std:: cout << "try 0:\n" << d_t_p->coeffRef(l, 0)<< "\n";
     new_deriv = (float) -exp(trans_alpha_beta(l, 0));
     d_t_p->coeffRef(l, 0) = (d_t_p->coeff(l, 0) - new_deriv);
-//    std:: cout << "DEN: (-expf(trans_alpha_beta(l, 0) - log_p_z_x))=:\n" << (-expf(trans_alpha_beta(l, 0) - log_p_z_x)) << "\n";
-//    std:: cout << "try 1:\n" << d_t_p->coeffRef(l, 0) + (-expf(trans_alpha_beta(l, 0) - log_p_z_x)) << "\n";
-//    std:: cout << "try 2:\n" << d_t_p->coeffRef(l, 0) - (-expf(trans_alpha_beta(l, 0) - log_p_z_x)) << "\n";
     new_deriv = (float) -exp(trans_alpha_beta(l, 1));
     d_t_p->coeffRef(l, 1) = (d_t_p->coeff(l, 1) - new_deriv);
-//    if (l != blank_index_) {
-//        d_t_p->coeffRef(l, 1) = 0.0;
-//    }
-//    std:: cout << "DEN: (-expf(trans_alpha_beta(l, 1) - log_p_z_x))=:\n" << (-expf(trans_alpha_beta(l, 1) - log_p_z_x)) << "\n";
 
-//    std::cout << "grad after = " << d_t_p->coeff(l, 2) << "\n";
-//    std:: cout << "DEN: (-expf(trans_alpha_beta(l, 2) - log_p_z_x))=:\n" << (-expf(trans_alpha_beta(l, 2) - log_p_z_x)) << "\n";
   }
-  //d_t_p->coeffRef(l, 0) = d_t_p->coeffRef(l, 0) - d_t_p->coeffRef(l, 1) - d_t_p->coeffRef(l, 2);
-  //d_t_p->coeffRef(l, 1) = d_t_p->coeffRef(l, 1) - d_t_p->coeffRef(l, 0) - d_t_p->coeffRef(l, 2);
-  //d_t_p->coeffRef(l, 2) = d_t_p->coeffRef(l, 2) - d_t_p->coeffRef(l, 0) - d_t_p->coeffRef(l, 1);
-//  std::cout << "Blank trans grad final: " << d_t_p->coeff(blank_index_,0) << " " << d_t_p->coeff(blank_index_,1) << "\n";
-
-  //d_t_p->coeffRef(blank_index_, 2) = 0; // No transition from blank label to the next blank label
-//  std::cout << "Gradients of numerator and denominator:\n";
-//  std::cout << "Gradient of priors:\n" << *d_priors << "\n";
-//  std::cout << "Gradient of transitions:\n" << *d_t_p << "\n";
-//  std::cout << "Gradient of y's:\n" << dy_b << "\n";
-
 }
 
-void CTCLossCalculator::GetLPrimeIndicesHMM(const std::vector<int>& l,
+void HmmMmiLossCalculator::GetLPrimeIndicesHMM(const std::vector<int>& l,
                                          std::vector<int>* l_prime) const {
   // Assumption is that l_prime is empty.
   l_prime->reserve(l.size());
-//  auto prev_label = -1;
 
   for (auto label : l) {
     l_prime->push_back(label);
-
-//    // Add blank between identical labels
-//    if (label == prev_label) {
-//        l_prime->push_back(blank_index_);
-//    }
   }
-
 }
 
-}  // namespace ctc
+}  // namespace hmm
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_CORE_UTIL_CTC_CTC_LOSS_CALCULATOR_H_
+#endif  // TENSORFLOW_CORE_UTIL_HMM_MMI_LOSS_CALCULATOR_H_

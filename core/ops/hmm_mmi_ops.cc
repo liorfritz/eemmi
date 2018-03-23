@@ -20,7 +20,7 @@ limitations under the License.
 #include "tensorflow/core/kernels/bounds_check.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
-#include "/home/lior/TensorFlowKaldi/my_tensorflow/core/util/hmm/hmm_map_loss_calculator_double_no_blank.h"
+#include "../util/hmm/hmm_mmi_loss_calculator.h"
 #include "tensorflow/core/util/sparse/sparse_tensor.h"
 
 namespace tensorflow {
@@ -28,9 +28,9 @@ namespace tensorflow {
 typedef Eigen::ThreadPoolDevice CPUDevice;
 const double kLogZero = -std::numeric_limits<double>::infinity();
 
-// CTC is Connectionist Temporal Classification.  See util/ctc/ for details.
+// MMI is maximum mutual information
 
-REGISTER_OP("HmmMapLoss")
+REGISTER_OP("HmmMmiLoss")
     .Attr("T: numbertype")
     .Input("inputs: float")
     .Input("labels_indices: int64")
@@ -73,7 +73,7 @@ REGISTER_OP("HmmMapLoss")
       return Status::OK();
     })
     .Doc(R"doc(
-Calculates the CTC Loss (log probability) for each batch entry.  Also calculates
+Calculates the MMI Loss (log probability) for each batch entry.  Also calculates
 the gradient.  This class performs the softmax operation for you, so inputs
 should be e.g. linear projections of outputs by an LSTM.
 
@@ -83,17 +83,12 @@ labels_indices: The indices of a `SparseTensor<int32, 2>`.
   `(batch b, time t)`.
 labels_values: The values (labels) associated with the given batch and time.
 sequence_length: A vector containing sequence lengths (batch).
-preprocess_collapse_repeated: Scalar, if true then repeated labels are
-  collapsed prior to the CTC calculation.
-hmm_merge_repeated: Scalar.  If set to false, *during* CTC calculation
-  repeated non-blank labels will not be merged and are interpreted as
-  individual labels.  This is a simplified version of CTC.
 loss: A vector (batch) containing log-probabilities.
 gradient: The gradient of `loss`.  3-D, shape:
   `(max_time x batch_size x num_classes)`.
 )doc");
 
-class HmmMapLossOp : public OpKernel {
+class HmmMmiLossOp : public OpKernel {
   typedef Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic,
                                          Eigen::RowMajor> >
       InputMap;
@@ -102,7 +97,7 @@ class HmmMapLossOp : public OpKernel {
       OutputMap;
 
  public:
-  explicit HmmMapLossOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+  explicit HmmMmiLossOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("preprocess_collapse_repeated",
                                      &preprocess_collapse_repeated_));
     OP_REQUIRES_OK(ctx,
@@ -180,7 +175,7 @@ class HmmMapLossOp : public OpKernel {
                 errors::InvalidArgument("label SparseTensor is not valid: ",
                                         labels_sp_valid.error_message()));
 
-    ctc::CTCLossCalculator::LabelSequences labels_t(batch_size);
+    hmm::HmmMmiLossCalculator::LabelSequences labels_t(batch_size);
     for (const auto& g : labels_sp.group({0})) {  // iterate by batch
       const int64 batch_indices = g.group()[0];
       OP_REQUIRES(ctx, FastBoundsCheck(batch_indices, batch_size),
@@ -241,10 +236,10 @@ class HmmMapLossOp : public OpKernel {
     trans_gradient_t.setZero();
 
     // Assumption: the blank index is num_classes - 1
-    ctc::CTCLossCalculator hmm_loss_calculator(num_classes - 1, 0);
+    hmm::HmmMmiLossCalculator hmm_mmi_loss_calculator(num_classes - 1, 0);
     DeviceBase::CpuWorkerThreads workers =
         *ctx->device()->tensorflow_cpu_worker_threads();
-    OP_REQUIRES_OK(ctx, hmm_loss_calculator.CalculateLoss(
+    OP_REQUIRES_OK(ctx, hmm_mmi_loss_calculator.CalculateLoss(
                             seq_len_t, labels_t, input_list_t, priors_t, transition_probs_t, lang_transition_probs_t,
                             preprocess_collapse_repeated_, hmm_merge_repeated_,
                             &loss_t, &gradient_list_t, &priors_gradient_t, &trans_gradient_t, &workers));
@@ -253,48 +248,9 @@ class HmmMapLossOp : public OpKernel {
  private:
   bool preprocess_collapse_repeated_;
   bool hmm_merge_repeated_;
-  TF_DISALLOW_COPY_AND_ASSIGN(HmmMapLossOp);
+  TF_DISALLOW_COPY_AND_ASSIGN(HmmMmiLossOp);
 };
 
-REGISTER_KERNEL_BUILDER(Name("HmmMapLoss").Device(DEVICE_CPU), HmmMapLossOp);
+REGISTER_KERNEL_BUILDER(Name("HmmMmiLoss").Device(DEVICE_CPU), HmmMmiLossOp);
 
 }  // namespace tensorflow
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
